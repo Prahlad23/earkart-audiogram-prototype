@@ -5,6 +5,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 import streamlit as st
 from pipeline import run_pipeline
 
+from extract import extract_from_report
+
 st.set_page_config(page_title="earKART AI Audiogram Prototype", layout="wide")
 st.title("AI-Assisted Audiogram Prototype")
 st.caption("Enter thresholds manually to simulate a completed hearing test.")
@@ -46,6 +48,26 @@ def threshold_inputs(label, key_prefix, default=25):
             help="dB HL - lower is better hearing"
         )
     return values
+
+st.markdown("### Auto-fill from an old report (optional)")
+uploaded = st.file_uploader("Upload a report (PDF or image)", type=["pdf", "png", "jpg", "jpeg"])
+
+if uploaded is not None:
+    temp_path = f"temp_{uploaded.name}"
+    with open(temp_path, "wb") as f:
+        f.write(uploaded.getbuffer())
+
+    result = extract_from_report(temp_path)
+
+    for freq, val in result["right_ac"].items():
+        st.session_state[f"r_ac_{freq}"] = val
+
+    for freq, val in result["left_ac"].items():
+        st.session_state[f"l_ac_{freq}"] = val
+
+    st.success("Right and Left ear AC auto-filled from the report.")
+    for w in result["warnings"]:
+        st.warning(w)
 
 with st.form("audiogram_form"):
     st.markdown("### Right Ear")

@@ -2,3 +2,5 @@ matplotlib
 streamlit
 pytest
 jinja2
+opencv-python-headless
+pymupdf
