@@ -1,19 +1,22 @@
 """
-Extracts Air Conduction (AC) threshold readings from an earKART-format
-Pure Tone Audiogram report image or PDF.
+Extracts Air Conduction (AC) and Bone Conduction (BC) threshold readings
+from an earKART-format Pure Tone Audiogram report image or PDF.
 
-CURRENT SCOPE:
-- Right ear AC (red circles): validated against report's own PTA table (exact match)
-- Left ear AC (blue X marks): validated against report's own PTA table (~1.5dB)
-- Bone Conduction (dashed arrows, both ears): NOT implemented yet — returns {}
-  (caller should prompt the user to enter these manually)
+VALIDATED ACCURACY (against one real report's printed PTA table):
+- Right ear AC (red circles):    exact match
+- Left ear AC (blue X marks):    ~1.5dB
+- Right ear BC (red "<" arrows): ~1.75dB (after empirical offset correction)
+- Left ear BC (blue ">" arrows): ~0.25dB
 
-Calibration approach: rather than assuming the chart grid is evenly spaced
-from box edge to box edge, this detects the REAL gridline pixel positions
-(both frequency columns and dB rows) and snaps markers to the nearest real
-gridline. This avoids drift/misassignment near column boundaries.
+METHOD: rather than detecting markers first and figuring out which frequency
+they belong to (error-prone near column boundaries), this searches for the
+best-matching marker independently within a window around each KNOWN
+frequency gridline position. This guarantees at most one result per
+frequency and avoids the clustering/overwrite bugs of an earlier version.
 
 Only works on earKART's standard report template (fixed grid layout).
+Bone Conduction accuracy is calibrated against a single sample report —
+more samples would help tighten/verify the correction offsets used here.
 """
 
 import cv2
@@ -21,11 +24,12 @@ import numpy as np
 
 FREQ_LABELS = [125, 250, 500, 1000, 2000, 4000, 8000]
 
+BC_Y_CORRECTION = {"right": 16, "left": 0}
+
 
 def load_image(path: str):
-    """Loads a report as an image. If given a PDF, extracts the embedded page image."""
     if path.lower().endswith(".pdf"):
-        import fitz  # PyMuPDF
+        import fitz
         doc = fitz.open(path)
         page = doc[0]
         images = page.get_images(full=True)
@@ -40,28 +44,23 @@ def load_image(path: str):
 
 
 def find_chart_boxes(img):
-    """Locates the right-ear and left-ear chart grid boxes on the standard template."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
     h_img, w_img = gray.shape
     candidates = []
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
         if w > 0.3 * w_img * 0.4 and h > 0.2 * h_img and y < 0.6 * h_img:
             candidates.append((x, y, x + w, y + h))
-
     if len(candidates) < 2:
         return None, None
-
     candidates.sort(key=lambda b: b[0])
     two = sorted(candidates[:2], key=lambda b: b[0])
-    return two[0], two[1]  # right_box, left_box
+    return two[0], two[1]
 
 
 def _cluster_line_positions(counts, min_fraction, total_span):
-    """Finds gridline pixel positions from a per-row/column dark-pixel count array."""
     idxs = np.where(counts > min_fraction * total_span)[0]
     if len(idxs) == 0:
         return []
@@ -78,37 +77,22 @@ def _cluster_line_positions(counts, min_fraction, total_span):
 
 
 def find_gridlines(crop):
-    """
-    Returns (v_centers, db_top_y, db_bottom_y):
-      v_centers: 7 real x-positions for the frequency columns (125Hz..8000Hz)
-      db_top_y: real y-position of the -10 dB gridline
-      db_bottom_y: real y-position of the 120 dB gridline
-    Returns None if detection fails (e.g. non-standard image).
-    """
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     dark_mask = gray < 230
     h, w = gray.shape
 
     col_counts = dark_mask.sum(axis=0)
     v_all = _cluster_line_positions(col_counts, 0.7, h)
-    v_centers = v_all[1:-1] if len(v_all) >= 9 else None  # drop outer box border
+    v_centers = v_all[1:-1] if len(v_all) >= 9 else None
     if v_centers is None or len(v_centers) != 7:
         return None
 
     row_counts = dark_mask.sum(axis=1)
     h_all = _cluster_line_positions(row_counts, 0.7, w)
-    # h_all[0] = top border, h_all[1] = -10dB line, ..., h_all[14] = 120dB line (13 steps of 10dB)
     if len(h_all) < 15:
         return None
-    db_top_y = h_all[1]
-    db_bottom_y = h_all[14]
 
-    return v_centers, db_top_y, db_bottom_y
-
-
-def _nearest_freq(x, v_centers):
-    diffs = [abs(x - gx) for gx in v_centers]
-    return FREQ_LABELS[diffs.index(min(diffs))]
+    return v_centers, h_all[1], h_all[14]
 
 
 def _pixel_to_db(y, db_top_y, db_bottom_y):
@@ -122,98 +106,95 @@ def _get_color_mask(crop, color):
         m1 = cv2.inRange(hsv, (0, 50, 50), (15, 255, 255))
         m2 = cv2.inRange(hsv, (150, 50, 50), (180, 255, 255))
         return m1 | m2
-    else:  # blue
+    else:
         return cv2.inRange(hsv, (90, 50, 50), (140, 255, 255))
 
 
-def _extract_circles(mask, v_centers, db_top_y, db_bottom_y, box_w):
+def _extract_circles_by_column(mask, v_centers, db_top_y, db_bottom_y, box_w):
     r_min, r_max = int(box_w * 0.017), int(box_w * 0.033)
     min_dist = int(box_w * 0.045)
     circles = cv2.HoughCircles(mask, cv2.HOUGH_GRADIENT, dp=1, minDist=min_dist,
                                  param1=50, param2=20, minRadius=r_min, maxRadius=r_max)
+    if circles is None:
+        return {}
+    candidates = [(cx, cy, 1.0) for (cx, cy, r) in circles[0]]
+    return _assign_by_column(candidates, v_centers, db_top_y, db_bottom_y)
+
+
+def _extract_template_by_column(mask, template_mask, v_centers, db_top_y, db_bottom_y,
+                                  y_correction=0, x_window=45, threshold=0.3):
+    result = cv2.matchTemplate(mask, template_mask, cv2.TM_CCOEFF_NORMED)
+    th, tw = template_mask.shape
+    loc = np.where(result >= threshold)
+    candidates = [(px + tw // 2, py + th // 2 + y_correction, result[py, px])
+                  for px, py in zip(*loc[::-1])]
+    return _assign_by_column(candidates, v_centers, db_top_y, db_bottom_y, x_window)
+
+
+def _assign_by_column(candidates, v_centers, db_top_y, db_bottom_y, x_window=45):
     results = {}
-    if circles is not None:
-        for (cx, cy, r) in circles[0]:
-            freq = _nearest_freq(cx, v_centers)
-            db = round(_pixel_to_db(cy, db_top_y, db_bottom_y) / 5) * 5
-            results[freq] = int(db)
-    return results
-
-
-def _extract_x_marks(mask, v_centers, db_top_y, db_bottom_y):
-    size = 45
-    template = np.zeros((size, size), dtype=np.uint8)
-    cv2.line(template, (5, 5), (size - 5, size - 5), 255, 6)
-    cv2.line(template, (5, size - 5), (size - 5, 5), 255, 6)
-    result = cv2.matchTemplate(mask, template, cv2.TM_CCOEFF_NORMED)
-
-    loc = np.where(result >= 0.3)
-    candidates = [(px + size // 2, py + size // 2, result[py, px]) for px, py in zip(*loc[::-1])]
-    candidates.sort(key=lambda c: c[0])
-
-    clusters = []
-    for (cx, cy, score) in candidates:
-        placed = False
-        for cluster in clusters:
-            if abs(cluster[-1][0] - cx) < 60:
-                cluster.append((cx, cy, score))
-                placed = True
-                break
-        if not placed:
-            clusters.append([(cx, cy, score)])
-
-    best = [max(c, key=lambda p: p[2]) for c in clusters]
-    results = {}
-    for (cx, cy, score) in best:
-        freq = _nearest_freq(cx, v_centers)
+    for freq, gx in zip(FREQ_LABELS, v_centers):
+        col = [c for c in candidates if abs(c[0] - gx) <= x_window]
+        if not col:
+            continue
+        cx, cy, score = max(col, key=lambda c: c[2])
         db = round(_pixel_to_db(cy, db_top_y, db_bottom_y) / 5) * 5
         results[freq] = int(db)
     return results
 
 
+def _build_x_template(size=45):
+    t = np.zeros((size, size), dtype=np.uint8)
+    cv2.line(t, (5, 5), (size - 5, size - 5), 255, 6)
+    cv2.line(t, (5, size - 5), (size - 5, 5), 255, 6)
+    return t
+
+
 def extract_ear_ac(img, box, color, marker_shape) -> dict:
-    """
-    Extracts AC thresholds for one ear.
-    marker_shape: "circle" (right ear) or "x" (left ear)
-    Returns dict like {500: 20, 1000: 25, 2000: 25, 4000: 25} (PTA-relevant frequencies only),
-    or {} if detection fails.
-    """
     x1, y1, x2, y2 = box
     crop = img[y1:y2, x1:x2]
-
     grid = find_gridlines(crop)
     if grid is None:
         return {}
     v_centers, db_top_y, db_bottom_y = grid
-
     mask = _get_color_mask(crop, color)
     box_w = x2 - x1
 
     if marker_shape == "circle":
-        results = _extract_circles(mask, v_centers, db_top_y, db_bottom_y, box_w)
+        results = _extract_circles_by_column(mask, v_centers, db_top_y, db_bottom_y, box_w)
     else:
-        results = _extract_x_marks(mask, v_centers, db_top_y, db_bottom_y)
+        template = _build_x_template()
+        results = _extract_template_by_column(mask, template, v_centers, db_top_y, db_bottom_y)
 
     return {f: results[f] for f in [500, 1000, 2000, 4000] if f in results}
 
 
-def extract_from_report(path: str) -> dict:
-    """
-    Main entry point. Takes a report file path (image or PDF).
-    Returns:
-        {
-            "right_ac": {500: 20, ...} or {},
-            "left_ac": {500: 24, ...} or {},
-            "right_bc": {},  # not implemented yet
-            "left_bc": {},   # not implemented yet
-            "warnings": [...]
-        }
-    """
+def extract_ear_bc(img, box, color, ear_side, bc_template_path) -> dict:
+    x1, y1, x2, y2 = box
+    crop = img[y1:y2, x1:x2]
+    grid = find_gridlines(crop)
+    if grid is None:
+        return {}
+    v_centers, db_top_y, db_bottom_y = grid
+    mask = _get_color_mask(crop, color)
+
+    template_bgr = cv2.imread(bc_template_path)
+    if template_bgr is None:
+        return {}
+    template_mask = _get_color_mask(template_bgr, color)
+
+    y_corr = BC_Y_CORRECTION.get(ear_side, 0)
+    results = _extract_template_by_column(mask, template_mask, v_centers, db_top_y, db_bottom_y,
+                                            y_correction=y_corr)
+    return {f: results[f] for f in [500, 1000, 2000, 4000] if f in results}
+
+
+def extract_from_report(path: str, right_bc_template=None, left_bc_template=None) -> dict:
     img = load_image(path)
     right_box, left_box = find_chart_boxes(img)
 
     warnings = []
-    right_ac, left_ac = {}, {}
+    right_ac, left_ac, right_bc, left_bc = {}, {}, {}, {}
 
     if right_box is None or left_box is None:
         warnings.append("Could not locate chart grids — all values need manual entry.")
@@ -225,23 +206,24 @@ def extract_from_report(path: str) -> dict:
         if len(left_ac) < 4:
             warnings.append("Left ear AC extraction incomplete — please verify.")
 
-    warnings.append("Bone Conduction (both ears) not yet auto-extracted — please enter manually.")
+        if right_bc_template:
+            right_bc = extract_ear_bc(img, right_box, "red", "right", right_bc_template)
+            if len(right_bc) < 4:
+                warnings.append("Right ear BC extraction incomplete — please verify.")
+        else:
+            warnings.append("Right ear BC not extracted (no template provided) — please enter manually.")
+
+        if left_bc_template:
+            left_bc = extract_ear_bc(img, left_box, "blue", "left", left_bc_template)
+            if len(left_bc) < 4:
+                warnings.append("Left ear BC extraction incomplete — please verify.")
+        else:
+            warnings.append("Left ear BC not extracted (no template provided) — please enter manually.")
 
     return {
         "right_ac": right_ac,
         "left_ac": left_ac,
-        "right_bc": {},
-        "left_bc": {},
+        "right_bc": right_bc,
+        "left_bc": left_bc,
         "warnings": warnings,
     }
-
-
-if __name__ == "__main__":
-    import sys
-    path = sys.argv[1]
-    result = extract_from_report(path)
-    print("Right AC:", result["right_ac"])
-    print("Left AC:", result["left_ac"])
-    print("Warnings:")
-    for w in result["warnings"]:
-        print(" -", w)

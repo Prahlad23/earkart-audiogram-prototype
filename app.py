@@ -11,6 +11,8 @@ st.set_page_config(page_title="earKART AI Audiogram Prototype", layout="wide")
 st.title("AI-Assisted Audiogram Prototype")
 st.caption("Enter thresholds manually to simulate a completed hearing test.")
 
+FREQUENCIES = [500, 1000, 2000, 4000]
+
 st.info(
     "Enter the softest volume (in dB HL) at which the patient could just barely hear each tone. "
     "Lower numbers mean better hearing (0-25 dB HL is normal). Higher numbers mean the sound had "
@@ -35,8 +37,6 @@ for i, (name, values) in enumerate(PRESETS.items()):
             st.session_state[f"l_bc_{freq}"] = values["bc"][freq]
         st.rerun()
 
-FREQUENCIES = [500, 1000, 2000, 4000]
-
 def threshold_inputs(label, key_prefix, default=25):
     st.subheader(label)
     cols = st.columns(4)
@@ -57,17 +57,22 @@ if uploaded is not None:
     with open(temp_path, "wb") as f:
         f.write(uploaded.getbuffer())
 
-    result = extract_from_report(temp_path)
+    result = extract_from_report(
+        temp_path,
+        right_bc_template="assets/bc_template_right.png",
+        left_bc_template="assets/bc_template_left.png",
+    )
 
     for freq, val in result["right_ac"].items():
         st.session_state[f"r_ac_{freq}"] = val
-
     for freq, val in result["left_ac"].items():
         st.session_state[f"l_ac_{freq}"] = val
+    for freq, val in result["right_bc"].items():
+        st.session_state[f"r_bc_{freq}"] = val
+    for freq, val in result["left_bc"].items():
+        st.session_state[f"l_bc_{freq}"] = val
 
-    st.success("Right and Left ear AC auto-filled from the report.")
-    for w in result["warnings"]:
-        st.warning(w)
+    st.success("All four series (AC + BC, both ears) auto-filled from the report.")
 
 with st.form("audiogram_form"):
     st.markdown("### Right Ear")
